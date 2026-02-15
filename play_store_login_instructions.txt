@@ -1,0 +1,16 @@
+This P2P app requires 2 devices.
+
+Device A:
+1. Tap "Create Room"
+2. Username: "Host"
+3. Passphrase: "123"
+4. Tap "Create Room" & wait
+
+Device B:
+1. Tap "Join Room"
+2. Username: "Guest"
+3. Connect to Username: "Host"
+4. Passphrase: "123"
+5. Tap "Join Room"
+
+Both devices will connect to the workspace.
