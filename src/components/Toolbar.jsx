@@ -7,7 +7,7 @@ const COLORS = [
 export default function Toolbar({
     status,
     myUsername,
-    peerUsername,
+    peerUsernames = [],
     drawColor,
     onColorChange,
     brushSize,
@@ -15,6 +15,8 @@ export default function Toolbar({
     isEraser,
     onEraserToggle,
     onClearCanvas,
+    onUndo,
+    canUndo = false,
     onDisconnect,
     activeTab,
     reconnectAttempt = 0,
@@ -28,8 +30,16 @@ export default function Toolbar({
             return { dotClass: 'status-offline', text: 'You\'re offline' };
         }
         switch (status) {
-            case 'connected':
-                return { dotClass: 'status-connected', text: `Connected with ${peerUsername}` };
+            case 'connected': {
+                const count = peerUsernames.length;
+                if (count === 0) {
+                    return { dotClass: 'status-connected', text: 'Connected' };
+                } else if (count === 1) {
+                    return { dotClass: 'status-connected', text: `Connected with ${peerUsernames[0]}` };
+                } else {
+                    return { dotClass: 'status-connected', text: `${count + 1} users in room` };
+                }
+            }
             case 'reconnecting':
                 if (maxRetriesReached) {
                     return { dotClass: 'status-disconnected', text: 'Connection lost' };
@@ -54,6 +64,15 @@ export default function Toolbar({
                     <span className={`status-dot ${dotClass}`}></span>
                     <span className="status-text">{text}</span>
                 </div>
+                {peerUsernames.length > 1 && status === 'connected' && (
+                    <div className="peer-avatars">
+                        {peerUsernames.map(name => (
+                            <span key={name} className="peer-avatar-chip" title={name}>
+                                {name.charAt(0).toUpperCase()}
+                            </span>
+                        ))}
+                    </div>
+                )}
                 {maxRetriesReached && onManualRetry && (
                     <button className="btn btn-retry btn-sm" onClick={onManualRetry}>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
@@ -106,6 +125,19 @@ export default function Toolbar({
                         <path d="M20 20H7L3 16a1 1 0 010-1.4l9.6-9.6a2 2 0 012.8 0L21 10.6a2 2 0 010 2.8L15 19" />
                     </svg>
                     Eraser
+                </button>
+
+                <button
+                    className={`tool-btn ${!canUndo ? 'disabled' : ''}`}
+                    onClick={onUndo}
+                    disabled={!canUndo}
+                    title="Undo (last stroke)"
+                >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                        <polyline points="1 4 1 10 7 10" />
+                        <path d="M3.51 15a9 9 0 102.13-9.36L1 10" />
+                    </svg>
+                    Undo
                 </button>
 
                 <button className="tool-btn" onClick={onClearCanvas} title="Clear Canvas">

@@ -685,6 +685,46 @@ body {
   color: var(--accent-secondary);
 }
 
+.tool-btn.disabled,
+.tool-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* --- Peer Avatar Chips --- */
+.peer-avatars {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-left: 4px;
+}
+
+.peer-avatar-chip {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--gradient-primary);
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid var(--bg-card);
+  box-shadow: 0 0 0 1px rgba(108, 92, 231, 0.3);
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+
+.peer-avatar-chip:nth-child(2n) {
+  background: linear-gradient(135deg, #00b894, #00cec9);
+}
+
+.peer-avatar-chip:nth-child(3n) {
+  background: linear-gradient(135deg, #fd79a8, #e84393);
+}
+
 /* --- Username Badge --- */
 .username-badge {
   font-size: 12px;

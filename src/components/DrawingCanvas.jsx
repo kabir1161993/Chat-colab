@@ -1,11 +1,60 @@
 import { useRef, useEffect, useCallback } from 'react';
 
-export default function DrawingCanvas({ onDraw, color, brushSize, onCanvasSave, savedCanvasData }) {
+const MAX_UNDO_STACK = 30;
+
+export default function DrawingCanvas({ onDraw, color, brushSize, onCanvasSave, savedCanvasData, onUndoComplete, onUndoStackChange }) {
     const canvasRef = useRef(null);
     const isDrawingRef = useRef(false);
     const lastPosRef = useRef({ x: 0, y: 0 });
     const saveTimerRef = useRef(null);
     const hasRestoredRef = useRef(false);
+    const undoStackRef = useRef([]);
+
+    // Notify parent about undo stack state
+    const reportUndoStack = useCallback(() => {
+        if (onUndoStackChange) {
+            onUndoStackChange(undoStackRef.current.length > 0);
+        }
+    }, [onUndoStackChange]);
+
+    // Save a snapshot of the canvas to the undo stack
+    const pushUndoSnapshot = useCallback(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        undoStackRef.current.push(imageData);
+        if (undoStackRef.current.length > MAX_UNDO_STACK) {
+            undoStackRef.current.shift();
+        }
+        reportUndoStack();
+    }, [reportUndoStack]);
+
+    // Perform undo locally
+    const performUndo = useCallback(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || undoStackRef.current.length === 0) return null;
+
+        const snapshot = undoStackRef.current.pop();
+        const ctx = canvas.getContext('2d');
+        ctx.putImageData(snapshot, 0, 0);
+        reportUndoStack();
+
+        // Return the restored canvas as data URL for syncing
+        const dpr = window.devicePixelRatio || 1;
+        // Create a temporary canvas at CSS pixel size for clean data URL
+        const tempCanvas = document.createElement('canvas');
+        const rect = canvas.getBoundingClientRect();
+        tempCanvas.width = rect.width;
+        tempCanvas.height = rect.height;
+        tempCanvas.getContext('2d').drawImage(canvas, 0, 0, rect.width, rect.height);
+        const dataUrl = tempCanvas.toDataURL();
+
+        // Save the restored state
+        if (onCanvasSave) onCanvasSave(dataUrl);
+
+        return dataUrl;
+    }, [onCanvasSave, reportUndoStack]);
 
     // Debounced canvas save — saves 500ms after the last stroke
     const scheduleSave = useCallback(() => {
@@ -67,6 +116,9 @@ export default function DrawingCanvas({ onDraw, color, brushSize, onCanvasSave, 
         const pos = getPos(e);
         lastPosRef.current = pos;
 
+        // Save snapshot before drawing (for undo)
+        pushUndoSnapshot();
+
         // Draw a dot for single clicks
         drawLine(pos.x, pos.y, pos.x + 0.1, pos.y + 0.1, color, brushSize);
 
@@ -77,7 +129,7 @@ export default function DrawingCanvas({ onDraw, color, brushSize, onCanvasSave, 
             x2: (pos.x + 0.1) / w, y2: (pos.y + 0.1) / h,
             color, brushSize,
         });
-    }, [getPos, getCanvasCSSSize, drawLine, color, brushSize, onDraw]);
+    }, [getPos, getCanvasCSSSize, drawLine, color, brushSize, onDraw, pushUndoSnapshot]);
 
     const handleMove = useCallback((e) => {
         if (!isDrawingRef.current) return;
@@ -103,7 +155,7 @@ export default function DrawingCanvas({ onDraw, color, brushSize, onCanvasSave, 
         scheduleSave();
     }, [scheduleSave]);
 
-    // Listen for peer draw events
+    // Listen for peer draw events, undo events, and clear events
     useEffect(() => {
         const handlePeerDraw = (e) => {
             const { x1, y1, x2, y2, color: c, brushSize: s } = e.detail;
@@ -117,6 +169,9 @@ export default function DrawingCanvas({ onDraw, color, brushSize, onCanvasSave, 
             if (!canvas) return;
             const ctx = canvas.getContext('2d');
             ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // Clear undo stack when canvas is cleared by peer
+            undoStackRef.current = [];
+            reportUndoStack();
         };
 
         const handleLocalClear = () => {
@@ -124,18 +179,55 @@ export default function DrawingCanvas({ onDraw, color, brushSize, onCanvasSave, 
             if (!canvas) return;
             const ctx = canvas.getContext('2d');
             ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // Clear undo stack when canvas is cleared locally
+            undoStackRef.current = [];
+            reportUndoStack();
+        };
+
+        const handleLocalUndo = () => {
+            const dataUrl = performUndo();
+            if (dataUrl && onUndoComplete) {
+                onUndoComplete(dataUrl);
+            }
+        };
+
+        const handlePeerUndo = (e) => {
+            const { dataUrl } = e.detail;
+            if (!dataUrl) return;
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            const { w, h } = getCanvasCSSSize();
+            const img = new Image();
+            img.onload = () => {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                const dpr = window.devicePixelRatio || 1;
+                ctx.save();
+                ctx.setTransform(1, 0, 0, 1, 0, 0);
+                ctx.scale(dpr, dpr);
+                ctx.drawImage(img, 0, 0, w, h);
+                ctx.restore();
+            };
+            img.src = dataUrl;
+            // Clear undo stack since canvas state was replaced
+            undoStackRef.current = [];
+            reportUndoStack();
         };
 
         window.addEventListener('peer-draw', handlePeerDraw);
         window.addEventListener('peer-clear-canvas', handlePeerClear);
         window.addEventListener('local-clear-canvas', handleLocalClear);
+        window.addEventListener('local-undo', handleLocalUndo);
+        window.addEventListener('peer-undo', handlePeerUndo);
 
         return () => {
             window.removeEventListener('peer-draw', handlePeerDraw);
             window.removeEventListener('peer-clear-canvas', handlePeerClear);
             window.removeEventListener('local-clear-canvas', handleLocalClear);
+            window.removeEventListener('local-undo', handleLocalUndo);
+            window.removeEventListener('peer-undo', handlePeerUndo);
         };
-    }, [drawLine]);
+    }, [drawLine, getCanvasCSSSize, performUndo, onUndoComplete, reportUndoStack]);
 
     // Setup canvas resolution
     useEffect(() => {

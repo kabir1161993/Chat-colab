@@ -22,7 +22,7 @@ export default function App() {
     const [error, setError] = useState('');
     const [messages, setMessages] = useState([]);
     const [myUsername, setMyUsername] = useState('');
-    const [peerUsername, setPeerUsername] = useState('');
+    const [peerUsernames, setPeerUsernames] = useState([]); // Array of connected peer names
     const [drawColor, setDrawColor] = useState('#6C5CE7');
     const [brushSize, setBrushSize] = useState(3);
     const [isEraser, setIsEraser] = useState(false);
@@ -32,20 +32,28 @@ export default function App() {
     const [reconnectAttempt, setReconnectAttempt] = useState(0);
     const [isNetworkOnline, setIsNetworkOnline] = useState(navigator.onLine);
     const [maxRetriesReached, setMaxRetriesReached] = useState(false);
+    const [isRoomCreator, setIsRoomCreator] = useState(false);
+    const [canUndo, setCanUndo] = useState(false);
 
     const peerRef = useRef(null);
-    const connRef = useRef(null);
+    // Map<peerId, DataConnection> for multi-user support
+    const connsRef = useRef(new Map());
     const keyRef = useRef(null);
     const reconnectTimerRef = useRef(null);
     const activeTabRef = useRef(activeTab);
-    const heartbeatIntervalRef = useRef(null);
-    const heartbeatTimeoutRef = useRef(null);
+    const heartbeatIntervalsRef = useRef(new Map()); // Map<peerId, intervalId>
+    const heartbeatTimeoutsRef = useRef(new Map()); // Map<peerId, timeoutId>
     const reconnectAttemptRef = useRef(0);
+    const isRoomCreatorRef = useRef(false);
 
-    // Keep ref in sync with activeTab state
+    // Keep refs in sync with state
     useEffect(() => {
         activeTabRef.current = activeTab;
     }, [activeTab]);
+
+    useEffect(() => {
+        isRoomCreatorRef.current = isRoomCreator;
+    }, [isRoomCreator]);
 
     // ─── Toast Helpers ───────────────────────────────────
     const addToast = useCallback((message, type = 'info') => {
@@ -64,57 +72,93 @@ export default function App() {
         }
     }, [messages]);
 
-    // ─── Heartbeat (Ping/Pong) ───────────────────────────
-    const stopHeartbeat = useCallback(() => {
-        if (heartbeatIntervalRef.current) {
-            clearInterval(heartbeatIntervalRef.current);
-            heartbeatIntervalRef.current = null;
-        }
-        if (heartbeatTimeoutRef.current) {
-            clearTimeout(heartbeatTimeoutRef.current);
-            heartbeatTimeoutRef.current = null;
+    // ─── Broadcast to all connected peers ────────────────
+    const broadcastToAll = useCallback(async (msg, excludePeerId = null) => {
+        if (!keyRef.current) return;
+        const encrypted = await encrypt(JSON.stringify(msg), keyRef.current);
+        for (const [peerId, conn] of connsRef.current.entries()) {
+            if (peerId !== excludePeerId) {
+                sendData(conn, encrypted);
+            }
         }
     }, []);
 
-    const startHeartbeat = useCallback(() => {
-        stopHeartbeat();
-        heartbeatIntervalRef.current = setInterval(async () => {
-            if (!connRef.current || !connRef.current.open || !keyRef.current) return;
+    // Check if any connection is open
+    const hasAnyConnection = useCallback(() => {
+        for (const conn of connsRef.current.values()) {
+            if (conn && conn.open) return true;
+        }
+        return false;
+    }, []);
+
+    // ─── Heartbeat (Ping/Pong) ───────────────────────────
+    const stopHeartbeatForPeer = useCallback((peerId) => {
+        const interval = heartbeatIntervalsRef.current.get(peerId);
+        if (interval) {
+            clearInterval(interval);
+            heartbeatIntervalsRef.current.delete(peerId);
+        }
+        const timeout = heartbeatTimeoutsRef.current.get(peerId);
+        if (timeout) {
+            clearTimeout(timeout);
+            heartbeatTimeoutsRef.current.delete(peerId);
+        }
+    }, []);
+
+    const stopAllHeartbeats = useCallback(() => {
+        for (const peerId of heartbeatIntervalsRef.current.keys()) {
+            stopHeartbeatForPeer(peerId);
+        }
+    }, [stopHeartbeatForPeer]);
+
+    const startHeartbeatForPeer = useCallback((peerId) => {
+        stopHeartbeatForPeer(peerId);
+
+        const intervalId = setInterval(async () => {
+            const conn = connsRef.current.get(peerId);
+            if (!conn || !conn.open || !keyRef.current) return;
 
             try {
                 const msg = JSON.stringify({ type: 'ping', timestamp: Date.now() });
                 const encrypted = await encrypt(msg, keyRef.current);
-                sendData(connRef.current, encrypted);
+                sendData(conn, encrypted);
 
                 // Set a timeout — if no pong comes back, trigger reconnection
-                heartbeatTimeoutRef.current = setTimeout(() => {
-                    if (connRef.current && connRef.current.open) {
-                        console.log('[Heartbeat] No pong received, triggering reconnection');
-                        connRef.current.close();
+                const timeoutId = setTimeout(() => {
+                    const c = connsRef.current.get(peerId);
+                    if (c && c.open) {
+                        console.log(`[Heartbeat] No pong from ${peerId}, closing connection`);
+                        c.close();
                     }
                 }, HEARTBEAT_TIMEOUT);
+                heartbeatTimeoutsRef.current.set(peerId, timeoutId);
             } catch (err) {
-                console.error('[Heartbeat] Error sending ping:', err);
+                console.error(`[Heartbeat] Error sending ping to ${peerId}:`, err);
             }
         }, HEARTBEAT_INTERVAL);
-    }, [stopHeartbeat]);
 
-    const handlePong = useCallback(() => {
-        // Clear the timeout — peer is alive
-        if (heartbeatTimeoutRef.current) {
-            clearTimeout(heartbeatTimeoutRef.current);
-            heartbeatTimeoutRef.current = null;
+        heartbeatIntervalsRef.current.set(peerId, intervalId);
+    }, [stopHeartbeatForPeer]);
+
+    const handlePong = useCallback((peerId) => {
+        const timeout = heartbeatTimeoutsRef.current.get(peerId);
+        if (timeout) {
+            clearTimeout(timeout);
+            heartbeatTimeoutsRef.current.delete(peerId);
         }
     }, []);
 
     // ─── Flush message queue on reconnect ────────────────
     const flushPendingMessages = useCallback(async () => {
-        if (!connRef.current || !keyRef.current) return;
+        if (connsRef.current.size === 0 || !keyRef.current) return;
 
         const count = await flushQueue(async (msg) => {
             const encrypted = await encrypt(JSON.stringify(msg), keyRef.current);
-            const sent = sendData(connRef.current, encrypted);
-            if (!sent) throw new Error('Connection not open');
+            let sent = false;
+            for (const conn of connsRef.current.values()) {
+                if (sendData(conn, encrypted)) sent = true;
+            }
+            if (!sent) throw new Error('No open connections');
         });
 
         if (count > 0) {
@@ -126,10 +170,29 @@ export default function App() {
         }
     }, [addToast]);
 
+    // ─── Remove a peer from connected list ───────────────
+    const removePeer = useCallback((peerId) => {
+        connsRef.current.delete(peerId);
+        stopHeartbeatForPeer(peerId);
+        setPeerUsernames(prev => prev.filter(u => u !== peerId));
+
+        if (connsRef.current.size === 0) {
+            setStatus('reconnecting');
+            setError('All peers disconnected. Waiting for new connections...');
+        }
+    }, [stopHeartbeatForPeer]);
+
     // ─── Setup incoming data handler ─────────────────────
     const setupConnection = useCallback((conn, peerName) => {
-        connRef.current = conn;
-        setPeerUsername(peerName);
+        // Add to connections map
+        connsRef.current.set(peerName, conn);
+
+        // Update peer usernames list
+        setPeerUsernames(prev => {
+            if (prev.includes(peerName)) return prev;
+            return [...prev, peerName];
+        });
+
         setStatus('connected');
         setView('main');
         setError('');
@@ -137,8 +200,8 @@ export default function App() {
         reconnectAttemptRef.current = 0;
         setMaxRetriesReached(false);
 
-        // Start heartbeat
-        startHeartbeat();
+        // Start heartbeat for this peer
+        startHeartbeatForPeer(peerName);
 
         // Flush any queued messages
         setTimeout(() => flushPendingMessages(), 500);
@@ -150,7 +213,6 @@ export default function App() {
 
                 // Handle heartbeat messages
                 if (parsed.type === 'ping') {
-                    // Respond with pong
                     const pong = JSON.stringify({ type: 'pong', timestamp: Date.now() });
                     const encrypted = await encrypt(pong, keyRef.current);
                     sendData(conn, encrypted);
@@ -158,8 +220,19 @@ export default function App() {
                 }
 
                 if (parsed.type === 'pong') {
-                    handlePong();
+                    handlePong(peerName);
                     return;
+                }
+
+                // ─── Relay logic (room creator only) ─────────
+                // If we are the room creator, relay the message to all other peers
+                if (isRoomCreatorRef.current) {
+                    const encrypted = await encrypt(JSON.stringify(parsed), keyRef.current);
+                    for (const [peerId, c] of connsRef.current.entries()) {
+                        if (peerId !== peerName) {
+                            sendData(c, encrypted);
+                        }
+                    }
                 }
 
                 if (parsed.type === 'chat') {
@@ -168,7 +241,7 @@ export default function App() {
                         text: parsed.text || '',
                         gifUrl: parsed.gifUrl || null,
                         sender: 'peer',
-                        senderName: peerName,
+                        senderName: parsed.senderName || peerName,
                         timestamp: parsed.timestamp,
                         status: 'received',
                     }]);
@@ -185,6 +258,19 @@ export default function App() {
                     window.dispatchEvent(new CustomEvent('peer-draw', { detail: parsed }));
                 } else if (parsed.type === 'clear-canvas') {
                     window.dispatchEvent(new CustomEvent('peer-clear-canvas'));
+                } else if (parsed.type === 'undo-canvas-state') {
+                    // Peer undid a stroke, sync canvas to the restored state
+                    window.dispatchEvent(new CustomEvent('peer-undo', { detail: parsed }));
+                } else if (parsed.type === 'peer-joined') {
+                    // Another peer joined (relayed by creator)
+                    setPeerUsernames(prev => {
+                        if (prev.includes(parsed.username)) return prev;
+                        return [...prev, parsed.username];
+                    });
+                    addToast(`${parsed.username} joined the room!`, 'success');
+                } else if (parsed.type === 'peer-left') {
+                    setPeerUsernames(prev => prev.filter(u => u !== parsed.username));
+                    addToast(`${parsed.username} left the room`, 'warning');
                 }
             } catch (err) {
                 console.error('[App] Failed to decrypt/parse message:', err);
@@ -192,14 +278,15 @@ export default function App() {
         });
 
         conn.on('close', () => {
-            connRef.current = null;
-            stopHeartbeat();
-            setStatus('reconnecting');
-            setError('Peer went offline. Reconnecting...');
-            addToast('Peer went offline', 'warning');
-            startReconnectLoop();
+            removePeer(peerName);
+            addToast(`${peerName} disconnected`, 'warning');
+
+            // If we're the room creator, notify remaining peers
+            if (isRoomCreatorRef.current) {
+                broadcastToAll({ type: 'peer-left', username: peerName });
+            }
         });
-    }, [startHeartbeat, stopHeartbeat, handlePong, flushPendingMessages, addToast]);
+    }, [startHeartbeatForPeer, handlePong, flushPendingMessages, addToast, removePeer, broadcastToAll]);
 
     // ─── Reconnect Logic (Exponential Backoff) ───────────
     const stopReconnectLoop = useCallback(() => {
@@ -221,11 +308,15 @@ export default function App() {
             peerRef.current = peer;
 
             if (session.mode === 'create') {
+                setIsRoomCreator(true);
                 peer.on('connection', (conn) => {
                     conn.on('open', () => {
                         stopReconnectLoop();
                         setupConnection(conn, conn.peer);
-                        addToast('Reconnected!', 'success');
+                        addToast(`${conn.peer} connected!`, 'success');
+
+                        // Notify all existing peers about the new joiner
+                        broadcastToAll({ type: 'peer-joined', username: conn.peer }, conn.peer);
                     });
                 });
             } else if (session.mode === 'join' && session.targetUsername) {
@@ -241,7 +332,7 @@ export default function App() {
                 peerRef.current = null;
             }
         }
-    }, [setupConnection, stopReconnectLoop, addToast]);
+    }, [setupConnection, stopReconnectLoop, addToast, broadcastToAll]);
 
     const startReconnectLoop = useCallback(() => {
         stopReconnectLoop();
@@ -279,14 +370,14 @@ export default function App() {
                 }
 
                 // Schedule next attempt if still not connected
-                if (!connRef.current || !connRef.current.open) {
+                if (!hasAnyConnection()) {
                     scheduleNext();
                 }
             }, delay);
         };
 
         scheduleNext();
-    }, [stopReconnectLoop, attemptReconnect, addToast]);
+    }, [stopReconnectLoop, attemptReconnect, addToast, hasAnyConnection]);
 
     // Manual retry after max retries reached
     const handleManualRetry = useCallback(() => {
@@ -304,7 +395,7 @@ export default function App() {
 
             // If we were in a session, trigger reconnection
             const saved = localStorage.getItem(SESSION_KEY);
-            if (saved && (!connRef.current || !connRef.current.open)) {
+            if (saved && !hasAnyConnection()) {
                 setStatus('reconnecting');
                 setError('Network restored. Reconnecting...');
                 setMaxRetriesReached(false);
@@ -315,7 +406,7 @@ export default function App() {
         const handleOffline = () => {
             setIsNetworkOnline(false);
             addToast('You\'re offline', 'warning');
-            stopHeartbeat();
+            stopAllHeartbeats();
 
             if (view === 'main') {
                 setStatus('offline');
@@ -330,13 +421,14 @@ export default function App() {
             window.removeEventListener('online', handleOnline);
             window.removeEventListener('offline', handleOffline);
         };
-    }, [addToast, startReconnectLoop, stopHeartbeat, view]);
+    }, [addToast, startReconnectLoop, stopAllHeartbeats, view, hasAnyConnection]);
 
     // ─── Create Room ─────────────────────────────────────
     const handleCreateRoom = useCallback(async (username, passphrase) => {
         setError('');
         setStatus('connecting');
         setMyUsername(username);
+        setIsRoomCreator(true);
         stopReconnectLoop();
 
         try {
@@ -348,8 +440,19 @@ export default function App() {
                 conn.on('open', () => {
                     setupConnection(conn, conn.peer);
                     addToast(`${conn.peer} connected!`, 'success');
+
+                    // Notify all existing peers about the new joiner
+                    broadcastToAll({ type: 'peer-joined', username: conn.peer }, conn.peer);
+
+                    // Tell the new joiner about all existing peers
+                    const existingPeers = Array.from(connsRef.current.keys()).filter(p => p !== conn.peer);
+                    for (const existingPeer of existingPeers) {
+                        encrypt(JSON.stringify({ type: 'peer-joined', username: existingPeer }), keyRef.current)
+                            .then(encrypted => sendData(conn, encrypted));
+                    }
+
                     localStorage.setItem(SESSION_KEY, JSON.stringify({
-                        mode: 'create', username, passphrase, peerUsername: conn.peer,
+                        mode: 'create', username, passphrase,
                     }));
                 });
             });
@@ -357,13 +460,14 @@ export default function App() {
             setError(err.message);
             setStatus('disconnected');
         }
-    }, [setupConnection, stopReconnectLoop, addToast]);
+    }, [setupConnection, stopReconnectLoop, addToast, broadcastToAll]);
 
     // ─── Join Room ───────────────────────────────────────
     const handleJoinRoom = useCallback(async (username, targetUsername, passphrase) => {
         setError('');
         setStatus('connecting');
         setMyUsername(username);
+        setIsRoomCreator(false);
         stopReconnectLoop();
 
         try {
@@ -389,22 +493,20 @@ export default function App() {
         const msg = {
             type: 'chat',
             text: text.trim(),
+            senderName: myUsername,
             timestamp: Date.now(),
         };
 
-        const isConnected = connRef.current && connRef.current.open;
+        const isConnected = hasAnyConnection();
 
         if (isConnected) {
             try {
-                const encrypted = await encrypt(JSON.stringify(msg), keyRef.current);
-                sendData(connRef.current, encrypted);
+                await broadcastToAll(msg);
             } catch (err) {
                 console.error('[App] Failed to send message:', err);
-                // Queue it if send fails
                 enqueue(msg);
             }
         } else {
-            // Queue the message for later
             enqueue(msg);
         }
 
@@ -416,7 +518,7 @@ export default function App() {
             timestamp: msg.timestamp,
             status: isConnected ? 'sent' : 'pending',
         }]);
-    }, [myUsername]);
+    }, [myUsername, hasAnyConnection, broadcastToAll]);
 
     // ─── Send GIF Message ────────────────────────────────
     const handleSendGif = useCallback(async (gifUrl) => {
@@ -425,15 +527,15 @@ export default function App() {
         const msg = {
             type: 'chat',
             gifUrl,
+            senderName: myUsername,
             timestamp: Date.now(),
         };
 
-        const isConnected = connRef.current && connRef.current.open;
+        const isConnected = hasAnyConnection();
 
         if (isConnected) {
             try {
-                const encrypted = await encrypt(JSON.stringify(msg), keyRef.current);
-                sendData(connRef.current, encrypted);
+                await broadcastToAll(msg);
             } catch (err) {
                 console.error('[App] Failed to send GIF:', err);
                 enqueue(msg);
@@ -451,24 +553,38 @@ export default function App() {
             timestamp: msg.timestamp,
             status: isConnected ? 'sent' : 'pending',
         }]);
-    }, [myUsername]);
+    }, [myUsername, hasAnyConnection, broadcastToAll]);
 
     // ─── Send Draw Data ──────────────────────────────────
     const handleDraw = useCallback(async (drawData) => {
-        if (!connRef.current) return;
-
+        if (!hasAnyConnection()) return;
         const msg = { type: 'draw', ...drawData };
-        const encrypted = await encrypt(JSON.stringify(msg), keyRef.current);
-        sendData(connRef.current, encrypted);
-    }, []);
+        await broadcastToAll(msg);
+    }, [hasAnyConnection, broadcastToAll]);
 
     // ─── Send Clear Canvas ───────────────────────────────
     const handleClearCanvas = useCallback(async () => {
-        if (!connRef.current) return;
-        const msg = { type: 'clear-canvas' };
-        const encrypted = await encrypt(JSON.stringify(msg), keyRef.current);
-        sendData(connRef.current, encrypted);
+        if (!hasAnyConnection()) return;
+        await broadcastToAll({ type: 'clear-canvas' });
         window.dispatchEvent(new CustomEvent('local-clear-canvas'));
+    }, [hasAnyConnection, broadcastToAll]);
+
+    // ─── Undo Canvas Stroke ──────────────────────────────
+    const handleUndo = useCallback(() => {
+        // Dispatch local undo event — DrawingCanvas will handle restoring snapshot
+        window.dispatchEvent(new CustomEvent('local-undo'));
+    }, []);
+
+    // Called by DrawingCanvas after undo with restored canvas data
+    const handleUndoComplete = useCallback(async (canvasDataUrl) => {
+        if (hasAnyConnection()) {
+            await broadcastToAll({ type: 'undo-canvas-state', dataUrl: canvasDataUrl });
+        }
+    }, [hasAnyConnection, broadcastToAll]);
+
+    // Called by DrawingCanvas to report undo stack state
+    const handleUndoStackChange = useCallback((hasItems) => {
+        setCanUndo(hasItems);
     }, []);
 
     // ─── Canvas State Persistence ────────────────────────
@@ -479,23 +595,30 @@ export default function App() {
     // ─── Disconnect ──────────────────────────────────────
     const handleDisconnect = useCallback(() => {
         stopReconnectLoop();
-        stopHeartbeat();
-        if (connRef.current) connRef.current.close();
+        stopAllHeartbeats();
+
+        // Close all connections
+        for (const conn of connsRef.current.values()) {
+            if (conn) conn.close();
+        }
+        connsRef.current.clear();
+
         if (peerRef.current) peerRef.current.destroy();
-        connRef.current = null;
         peerRef.current = null;
         keyRef.current = null;
         setStatus('disconnected');
         setView('connection');
         setMessages([]);
         setError('');
-        setPeerUsername('');
+        setPeerUsernames([]);
+        setIsRoomCreator(false);
         setReconnectAttempt(0);
         setMaxRetriesReached(false);
+        setCanUndo(false);
         localStorage.removeItem(SESSION_KEY);
         clearQueue();
         clearOfflineData();
-    }, [stopReconnectLoop, stopHeartbeat]);
+    }, [stopReconnectLoop, stopAllHeartbeats]);
 
     // ─── Auto-reconnect on mount ─────────────────────────
     useEffect(() => {
@@ -504,8 +627,7 @@ export default function App() {
             if (saved) {
                 const session = JSON.parse(saved);
                 setMyUsername(session.username);
-                if (session.targetUsername) setPeerUsername(session.targetUsername);
-                if (session.peerUsername) setPeerUsername(session.peerUsername);
+                if (session.mode === 'create') setIsRoomCreator(true);
 
                 // Restore persisted messages
                 const savedMessages = loadMessages();
@@ -530,8 +652,10 @@ export default function App() {
     useEffect(() => {
         return () => {
             stopReconnectLoop();
-            stopHeartbeat();
-            if (connRef.current) connRef.current.close();
+            stopAllHeartbeats();
+            for (const conn of connsRef.current.values()) {
+                if (conn) conn.close();
+            }
             if (peerRef.current) peerRef.current.destroy();
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -565,7 +689,7 @@ export default function App() {
             <Toolbar
                 status={status}
                 myUsername={myUsername}
-                peerUsername={peerUsername}
+                peerUsernames={peerUsernames}
                 drawColor={drawColor}
                 onColorChange={setDrawColor}
                 brushSize={brushSize}
@@ -573,6 +697,8 @@ export default function App() {
                 isEraser={isEraser}
                 onEraserToggle={() => setIsEraser(!isEraser)}
                 onClearCanvas={handleClearCanvas}
+                onUndo={handleUndo}
+                canUndo={canUndo}
                 onDisconnect={handleDisconnect}
                 activeTab={activeTab}
                 reconnectAttempt={reconnectAttempt}
@@ -598,6 +724,8 @@ export default function App() {
                         brushSize={isEraser ? brushSize * 3 : brushSize}
                         onCanvasSave={handleCanvasSave}
                         savedCanvasData={loadCanvas()}
+                        onUndoComplete={handleUndoComplete}
+                        onUndoStackChange={handleUndoStackChange}
                     />
                 </div>
             </div>
